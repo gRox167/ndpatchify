@@ -7,13 +7,8 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Literal,
-    Mapping,
-    NotRequired,
     Sequence,
     Tuple,
-    TypedDict,
-    Union,
 )
 
 import numpy as np
@@ -22,7 +17,13 @@ from beartype.door import is_bearable
 
 # from icecream import ic
 from jaxtyping import PyTree
-from optree import _C, tree_flatten, tree_map, tree_map_, tree_structure
+from optree import (
+    tree_flatten,
+    tree_map,
+    tree_map_,
+    tree_structure,
+    tree_transpose_map,
+)
 
 # from plum import dispatch, overload
 from xarray import DataArray
@@ -30,91 +31,13 @@ from xarray import DataArray
 from ._utils import *
 from ._utils import _transfer_to_device
 
-
-def tree_transpose_map(
-    func,
-    tree,
-    *rests,
-    inner_treespec=None,
-    is_leaf=None,
-    none_is_leaf=False,
-    namespace: str = "",
-):  # PyTree[PyTree[U]]
-    """Map a multi-input function over pytree args to produce a new pytree with transposed structure.
-
-    See also :func:`tree_map`, :func:`tree_map_with_path`, and :func:`tree_transpose`.
-
-    >>> tree = {'b': (2, [3, 4]), 'a': 1, 'c': (5, 6)}
-    >>> tree_transpose_map(  # doctest: +IGNORE_WHITESPACE
-    ...     lambda x: {'identity': x, 'double': 2 * x},
-    ...     tree
-    ... )
-    {
-        'identity': {'b': (2, [3, 4]), 'a': 1, 'c': (5, 6)},
-        'double': {'b': (4, [6, 8]), 'a': 2, 'c': (10, 12)}
-    }
-    >>> tree_transpose_map(  # doctest: +IGNORE_WHITESPACE
-    ...     lambda x: {'identity': x, 'double': (x, x)},
-    ...     tree,
-    ...     inner_treespec=tree_structure({'identity': 0, 'double': 0})
-    ... )
-    {
-        'identity': {'b': (2, [3, 4]), 'a': 1, 'c': (5, 6)},
-        'double': {'b': ((2, 2), [(3, 3), (4, 4)]), 'a': (1, 1), 'c': ((5, 5), (6, 6))}
-    }
-
-    Args:
-        func (callable): A function that takes ``1 + len(rests)`` arguments, to be applied at the
-            corresponding leaves of the pytrees.
-        tree (pytree): A pytree to be mapped over, with each leaf providing the first positional
-            argument to function ``func``.
-        rests (tuple of pytree): A tuple of pytrees, each of which has the same structure as
-            ``tree`` or has ``tree`` as a prefix.
-        inner_treespec (PyTreeSpec, optional): The treespec object representing the inner structure
-            of the result pytree. If not specified, the inner structure is inferred from the result
-            of the function ``func`` on the first leaf. (default: :data:`None`)
-        is_leaf (callable, optional): An optionally specified function that will be called at each
-            flattening step. It should return a boolean, with :data:`True` stopping the traversal
-            and the whole subtree being treated as a leaf, and :data:`False` indicating the
-            flattening should traverse the current object.
-        none_is_leaf (bool, optional): Whether to treat :data:`None` as a leaf. If :data:`False`,
-            :data:`None` is a non-leaf node with arity 0. Thus :data:`None` is contained in the
-            treespec rather than in the leaves list and :data:`None` will be remain in the result
-            pytree. (default: :data:`False`)
-        namespace (str, optional): The registry namespace used for custom pytree node types.
-            (default: :const:`''`, i.e., the global namespace)
-
-    Returns:
-        A new nested pytree with the same structure as ``inner_treespec`` but with the value at each
-        leaf has the same structure as ``tree``. The subtree at each leaf is given by the result of
-        function ``func(x, *xs)`` where ``x`` is the value at the corresponding leaf in ``tree`` and
-        ``xs`` is the tuple of values at corresponding nodes in ``rests``.
-    """
-    leaves, outer_treespec = _C.flatten(tree, is_leaf, none_is_leaf, namespace)
-    if outer_treespec.num_leaves == 0:
-        raise ValueError(
-            f"The outer structure must have at least one leaf. Got: {outer_treespec}."
-        )
-    flat_args = [leaves] + [outer_treespec.flatten_up_to(r) for r in rests]
-    outputs = list(map(func, *flat_args))
-
-    if inner_treespec is None:
-        inner_treespec = tree_structure(
-            outputs[0],
-            is_leaf=is_leaf,
-            none_is_leaf=none_is_leaf,
-            namespace=namespace,
-        )
-    if inner_treespec.num_leaves == 0:
-        raise ValueError(
-            f"The inner structure must have at least one leaf. Got: {inner_treespec}."
-        )
-
-    grouped = [inner_treespec.flatten_up_to(o) for o in outputs]
-    transposed = zip(*grouped)
-    subtrees = map(outer_treespec.unflatten, transposed)
-    return inner_treespec.unflatten(subtrees)
-
+def _calculate_pad_size(patch_size, overlap, dim):
+    effective_patch_size = round(patch_size * (1 - 2 * overlap))
+    overlap_size = round(patch_size*overlap)
+    if dim % effective_patch_size == 0:
+        return (overlap_size, overlap_size)
+    else:
+        return (overlap_size, effective_patch_size - (dim % effective_patch_size) + overlap_size)
 
 @overload
 def _pad_for_scaning_windows(
@@ -122,9 +45,25 @@ def _pad_for_scaning_windows(
     patch_size: Dict[str, int],
     overlap: Dict[str, float],
 ) -> Tuple[DataArray, PadSizes, Dict[str, int]]:
-    pad_sizes = tree_map(lambda x, y: (round(x * y),) * 2, patch_size, overlap)
-
-    output = pad(input, pad_sizes, mode="constant", value=0)
+    input_size_dict = dict(input.sizes)
+    input_dim_set = set(input_size_dict.keys())
+    patch_dim_set = set(patch_size.keys())
+    intersection = input_dim_set & patch_dim_set
+    # if input_dim_set != patch_dim_set:
+    if len(intersection):
+        common_patch_size = {k: patch_size[k] for k in intersection}
+        common_overlap = {k: overlap[k] for k in intersection}
+        common_dim = {k: input_size_dict[k] for k in intersection}
+        pad_sizes = tree_map(
+            _calculate_pad_size,
+            common_patch_size,
+            common_overlap,
+            common_dim,
+        )
+        output = pad(input, pad_sizes, mode="constant", value=0)
+    else:
+        output = input
+        pad_sizes = {}
     return output, pad_sizes
 
 
@@ -186,8 +125,12 @@ def generate_patch_location(
         return tuple(slice(i, i + 1) for i in range(0, dimension_size))
     else:
         step = int(patch_size * (1 - 2 * overlap))
+        dimension_size_without_boundry_overlap = round(
+            dimension_size - 2 * overlap * patch_size
+        )
         return tuple(
-            slice(i, i + patch_size) for i in range(0, dimension_size - step, step)
+            slice(i, i + patch_size)
+            for i in range(0, dimension_size_without_boundry_overlap, step)
         )
 
 
@@ -290,10 +233,12 @@ def infer(
         input_tree,
         inner_treespec=tree_structure((1, 1)),
     )
+    # ic(pad_sizes_tree)
     pad_sizes = merge_dicts(pad_sizes_tree, _is_pad_size)
     input_padded_size = get_dim_size_dict_from_tree(input_padded_tree, patch_dims)
+    # ic(input_padded_size)
     patch_location = generate_patch_location(patch_size, input_padded_size, overlap)
-
+    # ic(patch_location)
     output_padded_size_tree = tree_map(
         # only update exsiting keys
         lambda x: {k: input_padded_size.get(k, v) for k, v in x.items()},
@@ -398,3 +343,88 @@ def cutoff_filter(
 @dispatch
 def cutoff_filter(x, dims, patch_size, overlap):
     pass
+
+
+# def tree_transpose_map(
+#     func,
+#     tree,
+#     *rests,
+#     inner_treespec=None,
+#     is_leaf=None,
+#     none_is_leaf=False,
+#     namespace: str = "",
+# ):  # PyTree[PyTree[U]]
+#     """Map a multi-input function over pytree args to produce a new pytree with transposed structure.
+
+#     See also :func:`tree_map`, :func:`tree_map_with_path`, and :func:`tree_transpose`.
+
+#     >>> tree = {'b': (2, [3, 4]), 'a': 1, 'c': (5, 6)}
+#     >>> tree_transpose_map(  # doctest: +IGNORE_WHITESPACE
+#     ...     lambda x: {'identity': x, 'double': 2 * x},
+#     ...     tree
+#     ... )
+#     {
+#         'identity': {'b': (2, [3, 4]), 'a': 1, 'c': (5, 6)},
+#         'double': {'b': (4, [6, 8]), 'a': 2, 'c': (10, 12)}
+#     }
+#     >>> tree_transpose_map(  # doctest: +IGNORE_WHITESPACE
+#     ...     lambda x: {'identity': x, 'double': (x, x)},
+#     ...     tree,
+#     ...     inner_treespec=tree_structure({'identity': 0, 'double': 0})
+#     ... )
+#     {
+#         'identity': {'b': (2, [3, 4]), 'a': 1, 'c': (5, 6)},
+#         'double': {'b': ((2, 2), [(3, 3), (4, 4)]), 'a': (1, 1), 'c': ((5, 5), (6, 6))}
+#     }
+
+#     Args:
+#         func (callable): A function that takes ``1 + len(rests)`` arguments, to be applied at the
+#             corresponding leaves of the pytrees.
+#         tree (pytree): A pytree to be mapped over, with each leaf providing the first positional
+#             argument to function ``func``.
+#         rests (tuple of pytree): A tuple of pytrees, each of which has the same structure as
+#             ``tree`` or has ``tree`` as a prefix.
+#         inner_treespec (PyTreeSpec, optional): The treespec object representing the inner structure
+#             of the result pytree. If not specified, the inner structure is inferred from the result
+#             of the function ``func`` on the first leaf. (default: :data:`None`)
+#         is_leaf (callable, optional): An optionally specified function that will be called at each
+#             flattening step. It should return a boolean, with :data:`True` stopping the traversal
+#             and the whole subtree being treated as a leaf, and :data:`False` indicating the
+#             flattening should traverse the current object.
+#         none_is_leaf (bool, optional): Whether to treat :data:`None` as a leaf. If :data:`False`,
+#             :data:`None` is a non-leaf node with arity 0. Thus :data:`None` is contained in the
+#             treespec rather than in the leaves list and :data:`None` will be remain in the result
+#             pytree. (default: :data:`False`)
+#         namespace (str, optional): The registry namespace used for custom pytree node types.
+#             (default: :const:`''`, i.e., the global namespace)
+
+#     Returns:
+#         A new nested pytree with the same structure as ``inner_treespec`` but with the value at each
+#         leaf has the same structure as ``tree``. The subtree at each leaf is given by the result of
+#         function ``func(x, *xs)`` where ``x`` is the value at the corresponding leaf in ``tree`` and
+#         ``xs`` is the tuple of values at corresponding nodes in ``rests``.
+#     """
+#     leaves, outer_treespec = _C.flatten(tree, is_leaf, none_is_leaf, namespace)
+#     if outer_treespec.num_leaves == 0:
+#         raise ValueError(
+#             f"The outer structure must have at least one leaf. Got: {outer_treespec}."
+#         )
+#     flat_args = [leaves] + [outer_treespec.flatten_up_to(r) for r in rests]
+#     outputs = list(map(func, *flat_args))
+
+#     if inner_treespec is None:
+#         inner_treespec = tree_structure(
+#             outputs[0],
+#             is_leaf=is_leaf,
+#             none_is_leaf=none_is_leaf,
+#             namespace=namespace,
+#         )
+#     if inner_treespec.num_leaves == 0:
+#         raise ValueError(
+#             f"The inner structure must have at least one leaf. Got: {inner_treespec}."
+#         )
+
+#     grouped = [inner_treespec.flatten_up_to(o) for o in outputs]
+#     transposed = zip(*grouped)
+#     subtrees = map(outer_treespec.unflatten, transposed)
+#     return inner_treespec.unflatten(subtrees)

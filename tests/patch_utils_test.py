@@ -1,9 +1,9 @@
 import numpy as np
 import torch
-from icecream import ic
+from xarray import DataArray
+
 from ndpatchify import cutoff_filter, infer
 from ndpatchify._utils import _transfer_to_device
-from xarray import DataArray
 
 
 def test_pytree_xarray_kspace_to_image_patch_infer():
@@ -15,6 +15,10 @@ def test_pytree_xarray_kspace_to_image_patch_infer():
         DataArray(
             dims=("b", "ch", "sp", "len"),
             data=np.tile(np.arange(0, 32, dtype=np.float64), (1, 2, 3, 1)),
+        ),
+        DataArray(
+            dims=("z", "x", "y"),
+            data=np.tile(np.arange(0, 32, dtype=np.float64), (1, 2, 3)),
         ),
     ]
     output_sizes_tree = {"b": 1, "ch": 2, "h": 6, "w": 8}
