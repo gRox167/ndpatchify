@@ -16,8 +16,9 @@ import torch
 from beartype.door import is_bearable
 
 # from icecream import ic
-from jaxtyping import PyTree
+# from jaxtyping import PyTree
 from optree import (
+    PyTree,
     tree_flatten,
     tree_map,
     tree_map_,
@@ -31,13 +32,18 @@ from xarray import DataArray
 from ._utils import *
 from ._utils import _transfer_to_device
 
+
 def _calculate_pad_size(patch_size, overlap, dim):
     effective_patch_size = round(patch_size * (1 - 2 * overlap))
-    overlap_size = round(patch_size*overlap)
+    overlap_size = round(patch_size * overlap)
     if dim % effective_patch_size == 0:
         return (overlap_size, overlap_size)
     else:
-        return (overlap_size, effective_patch_size - (dim % effective_patch_size) + overlap_size)
+        return (
+            overlap_size,
+            effective_patch_size - (dim % effective_patch_size) + overlap_size,
+        )
+
 
 @overload
 def _pad_for_scaning_windows(
@@ -90,13 +96,21 @@ def _forward_for_scanning_windows(
     **kwargs: Any,
 ):
     for loc in patch_location:
-        data = tree_map(lambda x: x.isel(loc, missing_dims="ignore"), input_padded)
+        data = tree_map(
+            lambda x: x.isel(loc, missing_dims="ignore"), input_padded
+        )
         data_device = _transfer_to_device(data, device)
         result: PyTree[torch.Tensor] = func(data_device, *args, **kwargs)
         output_dims = tree_map(lambda x: x.dims, output)
-        result_merge_device = _transfer_to_device(result, merge_device, output_dims)
-        output_isel = tree_map(lambda x: x.isel(loc, missing_dims="ignore"), output)
-        tree_map_(lambda x, y: x + filter_func(y), output_isel, result_merge_device)
+        result_merge_device = _transfer_to_device(
+            result, merge_device, output_dims
+        )
+        output_isel = tree_map(
+            lambda x: x.isel(loc, missing_dims="ignore"), output
+        )
+        tree_map_(
+            lambda x, y: x + filter_func(y), output_isel, result_merge_device
+        )
     return output
 
 
@@ -167,7 +181,12 @@ def _is_named_size(x):
 def _is_pad_size(x):
     if flag := is_bearable(x, dict):
         for k, v in x.items():
-            flag = flag and isinstance(k, str) and isinstance(v, tuple) and len(v) == 2
+            flag = (
+                flag
+                and isinstance(k, str)
+                and isinstance(v, tuple)
+                and len(v) == 2
+            )
         return flag
     else:
         return flag
@@ -213,7 +232,7 @@ def inplace_add_at_location(
 
 @overload
 def infer(
-    input_tree: PyTree[DataArray],
+    input_tree: PyTree[DataArray | None],
     output_size_tree: PyTree[Dict[str, int]],
     func: Callable,
     patch_size: Dict[str, int],
@@ -235,9 +254,13 @@ def infer(
     )
     # ic(pad_sizes_tree)
     pad_sizes = merge_dicts(pad_sizes_tree, _is_pad_size)
-    input_padded_size = get_dim_size_dict_from_tree(input_padded_tree, patch_dims)
+    input_padded_size = get_dim_size_dict_from_tree(
+        input_padded_tree, patch_dims
+    )
     # ic(input_padded_size)
-    patch_location = generate_patch_location(patch_size, input_padded_size, overlap)
+    patch_location = generate_patch_location(
+        patch_size, input_padded_size, overlap
+    )
     # ic(patch_location)
     output_padded_size_tree = tree_map(
         # only update exsiting keys
@@ -254,11 +277,15 @@ def infer(
         is_leaf=_is_named_size,
     )
     for loc in patch_location:
-        data = tree_map(lambda x: x.isel(loc, missing_dims="ignore"), input_padded_tree)
+        data = tree_map(
+            lambda x: x.isel(loc, missing_dims="ignore"), input_padded_tree
+        )
         data_device = _transfer_to_device(data, device)
         result: PyTree[torch.Tensor] = func(data_device, *args, **kwargs)
         output_dims = tree_map(lambda x: x.dims, output_padded_tree)
-        result_merge_device = _transfer_to_device(result, merge_device, output_dims)
+        result_merge_device = _transfer_to_device(
+            result, merge_device, output_dims
+        )
         result_filtered = filter_func(result_merge_device, patch_size, overlap)
         output_padded_tree = tree_map_(
             lambda x, y: inplace_add_at_location(x, loc, y),
@@ -270,7 +297,9 @@ def infer(
         output_size_tree,
         is_leaf=_is_named_size,
     )
-    output_cropped = crop(output_padded_tree, start_indices_tree, output_size_tree)
+    output_cropped = crop(
+        output_padded_tree, start_indices_tree, output_size_tree
+    )
     # ic(output_cropped[0].shape)
     return output_cropped
 
@@ -293,7 +322,9 @@ def infer(
 
 
 @overload
-def cutoff_filter(x: Tensor, dim: int, patch_size: int, overlap: float) -> Tensor:
+def cutoff_filter(
+    x: Tensor, dim: int, patch_size: int, overlap: float
+) -> Tensor:
     x = x.clone()
     step = int(patch_size * (1 - overlap))
     crop_start = int(patch_size * overlap) // 2
@@ -327,10 +358,14 @@ def set_zero_(data, slices):
 
 @overload
 def cutoff_filter(
-    data: PyTree[DataArray, "T"], patch_size: Dict[str, int], overlap: Dict[str, float]
+    data: PyTree[DataArray, "T"],
+    patch_size: Dict[str, int],
+    overlap: Dict[str, float],
 ) -> PyTree[DataArray, "T"]:
     data = tree_map(lambda x: x.copy(deep=True), data)
-    front_cut_slices = tree_map(lambda x, y: slice(0, int(x * y)), patch_size, overlap)
+    front_cut_slices = tree_map(
+        lambda x, y: slice(0, int(x * y)), patch_size, overlap
+    )
     back_cut_slices = tree_map(
         lambda x, y: slice(int(x * (1 - y)), None), patch_size, overlap
     )
