@@ -24,7 +24,7 @@ requires-python = ">= 3.8"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.rye]
+[tool.uv]
 managed = true
 dev-dependencies = [
     "pytest>=8.2.0",
@@ -36,3 +36,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ndpatchify"]
+
+[tool.ruff]
+lint.ignore = ["F722", "F821", "F811"]

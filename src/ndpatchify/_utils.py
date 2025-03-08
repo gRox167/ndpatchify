@@ -1,6 +1,5 @@
 from typing import (
     Any,
-    Callable,
     Dict,
     Literal,
     NotRequired,
